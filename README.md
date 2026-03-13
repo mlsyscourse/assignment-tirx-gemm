@@ -800,10 +800,6 @@ It should list exactly one file:
 -rw-rw-r-- ... gemm_kernels.py
 ```
 
-### Submit to Autolab
+### Submission
 
-Go to [Autolab](https://autolab.andrew.cmu.edu/courses/15442-s26/assessments/TIRX-GEMM) and submit `handin.tar`.
-
-You can submit multiple times. The timestamp of each submission is used to determine any late penalties. Make sure your submitted `gemm_kernels.py` is complete, otherwise the autograder may not process your submission properly.
-
-**Any attempt to manipulate or compromise the integrity of the autograder will result in severe penalties.**
+**Note: Submissions are not open yet. We will provide the submission details later this week.**
