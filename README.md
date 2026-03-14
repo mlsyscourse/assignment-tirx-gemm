@@ -459,7 +459,8 @@ The scheduler orders tiles in an L2-cache-friendly pattern (processing nearby ti
 
 **Implementation hints:**
 - `bx = Tx.cta_id([SM_COUNT], parent="kernel")` — single-dimensional grid.
-- `m_st = Tx.meta_var(tile_scheduler.m_idx * BLK_M)`, `n_st = Tx.meta_var(tile_scheduler.n_idx * BLK_N)`.
+- `m_st = Tx.meta_var(tile_scheduler.m_idx * BLK_M)`.
+- `n_st = Tx.meta_var(tile_scheduler.n_idx * BLK_N)`.
 - The K-loop and pipeline logic remain the same as step 5.
 
 **Test:** `pytest tests/test_step06.py -xvs`
