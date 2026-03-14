@@ -193,7 +193,7 @@ def hgemm_v3(M, N, K):
 # ======================================================================
 # Step 4: TMA async load
 #   Replace sync load with TMA (single-thread dispatch, mbarrier sync).
-#   Writeback still sync (TMEM→RF→GMEM).
+#   Writeback uses TMA store: TMEM → RF → SMEM → TMA → GMEM.
 # ======================================================================
 
 def hgemm_v4(M, N, K):
