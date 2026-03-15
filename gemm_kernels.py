@@ -274,7 +274,7 @@ def hgemm_v4(M, N, K):
 
 # ======================================================================
 # Step 5: Software pipeline
-#   PIPE_DEPTH=4 multi-buffered SMEM. Prefetch + overlap.
+#   PIPE_DEPTH=2 multi-buffered SMEM. Prefetch + overlap.
 # ======================================================================
 
 def hgemm_v5(M, N, K):
@@ -285,7 +285,7 @@ def hgemm_v5(M, N, K):
 
     BLK_M, BLK_N, BLK_K = 128, 128, 64
     K_TILES = K // BLK_K
-    PIPE_DEPTH = 4
+    PIPE_DEPTH = 2
     PRE_NUM = min(PIPE_DEPTH, K_TILES)
 
     A_layout = tma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM, (PIPE_DEPTH, BLK_M, BLK_K))
@@ -326,7 +326,7 @@ def hgemm_v6(M, N, K):
 
     BLK_M, BLK_N, BLK_K = 128, 128, 64
     K_TILES = K // BLK_K
-    PIPE_DEPTH = 4
+    PIPE_DEPTH = 2
     PRE_NUM = min(PIPE_DEPTH, K_TILES)
 
     A_layout = tma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM, (PIPE_DEPTH, BLK_M, BLK_K))
