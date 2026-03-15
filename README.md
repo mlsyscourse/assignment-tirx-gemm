@@ -678,6 +678,7 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 | `pool.move_base_to(offset)` | Set next allocation offset (for overlapping buffers) |
 | `pool.commit()` | Finalize all allocations |
 | `Tx.alloc_local(shape, dtype)` | Allocate per-thread register buffer |
+| `buf.view(shape, layout=...)` | Create a view of a register buffer with a different layout |  
 | `Tx.decl_buffer(shape, dtype, scope="tmem", ...)` | Declare a TMEM buffer |
 | `Tx.ptx.tcgen05.alloc(addr, n_cols, cta_group)` | Allocate TMEM |
 | `Tx.ptx.tcgen05.dealloc(addr, n_cols, cta_group)` | Deallocate TMEM |
@@ -724,6 +725,7 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 - **Fence API**: Use `Tx.ptx.fence.proxy_async("shared::cta")` — positional argument, not keyword `scope=`.
 - **GPU flakiness**: If tests fail intermittently, check `nvidia-smi` and switch to an idle GPU.
 - **Dsmem overlap**: `pool.move_base_to(1024)` before Dsmem allows it to overlap with Asmem/Bsmem (reusing memory after MMA is done).
+- **`alloc_local` vs `decl_buffer`**: Use `Tx.alloc_local` for register buffers. `Tx.decl_buffer` is only for hardware-managed memory like TMEM. To do cross-thread operations, create a view with `.view()` — but use the original `alloc_local` buffer (not the view) for thread-level operations like `Tx.cast`.  
 
 ---
 
