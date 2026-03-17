@@ -378,7 +378,7 @@ This requires allocating a `Dsmem` buffer with a TMA-compatible swizzled layout 
 **What you will learn:**
 - Overlapping TMA loads with MMA computation using double buffering
 - Multi-buffered shared memory: `Asmem[stage, :, :]`
-- Per-stage phase tracking
+- Pipeline stage and phase tracking 
 - Prefetch loop pattern
 
 **Background:**
@@ -428,7 +428,7 @@ Each stage has its own mbarrier and phase counter. The pattern is:
 - `Asmem = pool.alloc((PIPE_DEPTH, BLK_M, BLK_K), ...)`
 - `tma_bar = pool.alloc((PIPE_DEPTH,), "uint64", ...)`
 - Stage tracking: `stage = k % PIPE_DEPTH`
-- Per-stage phase: `phase_tma[stage]`
+- Phase flips when stage wraps back to 0: `phase ^= 1`
 
 **Test:** `pytest tests/test_step05.py -xvs`
 
