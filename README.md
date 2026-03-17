@@ -731,6 +731,14 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 
 ---
 
+## Debugging: Inspect Generated CUDA Source
+
+We offer ways for you to generate CUDA/PTX code to debugif you are interested.
+You can use `inspect_cuda.py` to view the generated code for any kernel step. 
+See the file header for usage details.
+
+---
+
 ## Performance Evaluation
 
 GEMM performance is measured in TFLOPS (Tera Floating-Point Operations Per Second):
