@@ -25,51 +25,61 @@ flowchart TB
 
     GMEM -->|"TMA (async, HW-driven)"| SMEM
     SMEM -->|"tcgen05 MMA (async, HW-driven)"| TMEM
-    TMEM -->|"LD_TMEM (warpgroup read)"| RF
+    TMEM -->|"tcgen05.ld (warpgroup read)"| RF
     SMEM <-->|"TMA store (async)"| GMEM
 ```
 
-- **Tensor Memory (TMEM)** is new in Blackwell. It is a high-bandwidth scratchpad memory private to the Tensor Cores. The tcgen05 MMA unit writes its output directly to TMEM (not to registers or shared memory). To read the results, you must explicitly load from TMEM to the register file (`LD_TMEM`).
+- **Tensor Memory (TMEM)** is new in Blackwell. It is a high-bandwidth scratchpad memory private to the Tensor Cores. The tcgen05 MMA unit writes its output directly to TMEM (not to registers or shared memory). To read the results, you must explicitly load from TMEM to the register file. Reading TMEM requires all 128 threads in a **warpgroup** (4 consecutive warps) to cooperate.
 
-- **TMEM is not directly addressable** by normal instructions — it is accessed through a special address space with `TLane` (row, mapped to threads) and `TCol` (column) axes. You allocate TMEM via `tcgen05.alloc` and deallocate via `tcgen05.dealloc`.
+- **TMEM is not directly addressable** by normal instructions — it is accessed through a special 2D address space with rows (mapped to threads) and columns. TMEM must be explicitly allocated before use and deallocated afterward.
 
 ### TMA (Tensor Memory Accelerator)
 
-TMA is a hardware unit that asynchronously copies rectangular tiles between global memory and shared memory. Key advantages over traditional `__shared__` loads:
+TMA is a hardware unit that asynchronously copies rectangular tiles between global memory and shared memory (both load and store). Key advantages over manual data movement:
 
 - **No thread involvement**: A single thread issues the TMA command; the hardware handles the actual data transfer in the background. Other threads don't need to participate.
-- **Swizzled layouts**: TMA understands the memory layout and can perform address swizzling on-the-fly, which is essential for efficient Tensor Core access patterns.
-- **Byte counting**: TMA works with mbarriers — when the transfer completes, the hardware automatically signals the barrier. The programmer specifies the expected byte count (`expect_tx`), and the hardware arrives on the barrier when that many bytes have been transferred.
-
-TMA also supports **store** operations: moving data from shared memory back to global memory.
+- **Swizzled layouts**: TMA hardware automatically applies address swizzling during the transfer, ensuring bank-conflict-free access for Tensor Cores.
+- **Byte counting**: TMA loads work with mbarriers — the programmer tells the barrier how many bytes to expect, and the hardware automatically signals it once that many bytes have been transferred. TMA stores use a separate completion mechanism (commit group + wait).
 
 ### tcgen05 (Tensor Core MMA)
 
 `tcgen05` is Blackwell's matrix multiply-accumulate (MMA) unit. It reads A and B operands from shared memory and writes the result to tensor memory. Key properties:
 
-- **Asynchronous**: You issue `gemm_async` and the computation runs in the background. The instruction returns immediately.
-- **Commit + mbarrier**: After issuing MMA, you call `tcgen05.commit` to tell the hardware "when all pending MMAs are done, signal this mbarrier." This enables the next pipeline stage to know when the result is ready.
-- **cta_group**: Controls how many CTAs cooperate on a single MMA operation. With `cta_group=2`, two CTAs contribute their B tiles to a wider matrix multiply.
+- **Asynchronous**: The MMA instruction returns immediately; computation runs in the background.
+- **Single-thread dispatch**: Only one elected thread per warp issues MMA and commit. Other threads do not participate.
+- **Accumulation mode**: The MMA can either overwrite TMEM or add to existing values. The first iteration of a K-loop overwrites; subsequent iterations accumulate partial results.
+- **Commit + mbarrier**: After issuing one or more MMAs, a commit groups them together. The hardware will signal the specified mbarrier when all MMAs in that group complete. The commit itself returns immediately — the mbarrier is signaled later when the hardware finishes.
+- **cta_group**: Controls how many CTAs cooperate on a single MMA. With cta_group=2, only CTA-0 issues the MMA instruction, but the hardware reads B from **both** CTAs' shared memory via the cluster address space, producing a wider output (2x columns). Each CTA still loads its own A tile (different M rows).
 
 ### mbarrier (Memory Barrier)
 
-mbarriers are hardware synchronization primitives stored in shared memory. They support:
+mbarriers are hardware synchronization primitives stored in shared memory. They combine a counter with a phase bit to enable reusable, asynchronous synchronization.
 
-- **arrive**: Signal "I'm done" (decrement a counter). TMA and tcgen05 can arrive on mbarriers directly — no thread needed.
-- **wait**: Block until all expected arrivals have occurred.
-- **Phase flipping**: mbarriers alternate between phase 0 and phase 1, allowing the same barrier to be reused across pipeline stages without confusion.
+**Lifecycle of an mbarrier:**
+
+1. **Init**: Set the expected number of arrivals. The barrier starts at phase 0.
+2. **Arrive**: Each arrival decrements the counter. There are three ways to arrive:
+   - **TMA auto-arrive**: When you issue a TMA load targeting an mbarrier, the hardware arrives automatically once the byte transfer completes. You tell the barrier how many bytes to expect beforehand.
+   - **tcgen05 auto-arrive**: When you commit a group of MMAs to an mbarrier, the hardware arrives once those MMAs complete.
+   - **Thread arrive**: A thread arrives explicitly (used, e.g., by writeback threads to signal "TMEM is free").
+3. **Wait**: Block until the barrier's current phase matches the expected phase — meaning all arrivals for that round have occurred.
+4. **Phase flip**: Once all arrivals are done, the barrier automatically toggles its phase (0 → 1 → 0 → ...). This lets the same barrier be reused across loop iterations without confusion: iteration 0 uses phase 0, iteration 1 uses phase 1, iteration 2 uses phase 0 again, and so on. The caller tracks the expected phase and flips it after each wait.
 
 This is the key to overlapping computation with memory transfers: TMA automatically arrives on a barrier when data is ready, and the MMA warp waits on that barrier before computing.
 
-### Warpgroups
+### Synchronization Rules
 
-A warpgroup consists of 4 consecutive warps (128 threads). TIRX organizes the thread hierarchy as:
+Blackwell has multiple asynchronous hardware units (threads, TMA, tcgen05 MMA) that read and write different memory spaces (GMEM, SMEM, TMEM, registers). Whenever data crosses from one unit or memory space to another, you need explicit synchronization to ensure the producer is done before the consumer reads. The general pattern is:
 
-```
-kernel > cluster > CTA > warpgroup > warp > thread
-```
+| Data flow | Synchronization needed |
+|---|---|
+| Threads write SMEM → MMA reads SMEM | `cta_sync()` (wait for all threads) + `fence.after_thread_sync()` (make SMEM visible to MMA hardware) |
+| MMA writes TMEM → Threads read TMEM | `mbarrier.try_wait` (wait for MMA to complete) + `fence.after_thread_sync()` (make TMEM visible to subsequent reads) |
+| Threads write SMEM → TMA reads SMEM (store) | `fence.proxy_async("shared::cta")` (flush SMEM writes) |
+| Alloc barriers/TMEM → Use them | `fence.proxy_async` + `fence.mbarrier_init` + `cta_sync()` |
+| All work done → Deallocate TMEM | `cta_sync()` for single-CTA kernels, `cluster_sync()` for cluster kernels. Ensures all CTAs are done before any CTA deallocates. |
 
-Warpgroup-level operations include TMEM reads (all 128 threads in a warpgroup participate) and warpgroup-level synchronization.
+The key insight: `cta_sync()` synchronizes **threads** with each other, but the MMA and TMA hardware operate independently from threads. Fences (`fence.after_thread_sync`, `fence.proxy_async`) bridge the gap between thread-visible memory and hardware-visible memory.
 
 ### CTA Clusters
 
@@ -79,13 +89,13 @@ Blackwell supports **CTA clusters** — groups of CTAs that can cooperate via:
 - **Multicast TMA**: A single TMA command can deliver the same data to multiple CTAs simultaneously, reducing global memory bandwidth.
 - **Cross-CTA barrier signaling**: mbarrier arrive/wait across CTAs in the cluster.
 
-For GEMM, clustering allows the `cta_group=2` MMA to cross-read B from both CTAs' shared memory via the cluster address space. Each CTA loads its own A and B tiles independently, but the MMA hardware combines both CTAs' B into a wider output, effectively doubling the compute-to-memory ratio.
+For GEMM, clustering enables the MMA to cross-read B from both CTAs' shared memory, effectively doubling the output width without additional global memory bandwidth. This is used in steps 9-10.
 
 ---
 
 ## TIRX Primer
 
-TIRX is an extended Tensor IR built on top of TVM. It provides a Python DSL for writing GPU kernels that map directly to hardware features. Here is the anatomy of a minimal TIRX kernel:
+TIRX is an extended Tensor IR built on top of TVM. It provides a Python DSL for writing GPU kernels that map directly to hardware features. Here is a simplified sketch showing the key elements (not a complete kernel — synchronization and writeback are omitted):
 
 ```python
 @Tx.prim_func(tirx=True)                    # Declare a TIRX primitive function
@@ -106,16 +116,16 @@ def kernel(A: Tx.Buffer((M, K), "float16"),  # Typed buffer parameters
                        accum=False, dispatch="tcgen05", cta_group=1)
 ```
 
-Key conventions:
-- **Scope nesting**: `Tx.kernel()` > `Tx.cta()` > `Tx.warpgroup()` > `Tx.warp()` > `Tx.thread()` control which threads execute a block.
-- **`Tx.meta_var`**: Creates compile-time aliases for expressions (e.g., `m_st = Tx.meta_var(bx * 128)`).
-- **`Tx.ptx.*`**: Direct access to PTX intrinsics (mbarrier, tcgen05, fences, etc.).
-- **Layouts**: `tma_shared_layout(dtype, SwizzleMode, shape)` creates swizzled layouts for shared memory buffers that are compatible with TMA.
+Beyond what the sketch shows, you will need to learn:
+- **Scope nesting**: `Tx.kernel()` > `Tx.cta()` > `Tx.warpgroup()` > `Tx.warp()` > `Tx.thread()` control which threads execute a block. For example, `Tx.copy` inside `with Tx.cta():` means all threads cooperate on the copy; inside `with Tx.thread():` means each thread copies independently.
+- **`Tx.meta_var`**: Creates compile-time aliases for expressions (e.g., `m_st = Tx.meta_var(bx * 128)`). Use this when you need to pass a computed offset to buffer slicing.
+- **`Tx.ptx.*`**: Direct access to PTX intrinsics — the hardware-level operations introduced in the Background section (mbarrier init/arrive/wait, tcgen05 alloc/commit, memory fences).
+- **Layouts**: `tma_shared_layout(dtype, SwizzleMode, shape)` creates swizzled layouts for shared memory buffers. You don't need to understand swizzle internals — just pass this layout when allocating SMEM buffers that will be used with TMA or MMA.
 
 
 ### Axe Layout
 
-This kernel uses **Axe Layout** ([Hou et al., 2026](https://arxiv.org/abs/2601.19092)), a hardware-aware layout abstraction that maps logical tensor coordinates to named physical axes. Instead of manually computing memory addresses or thread-to-element mappings (as in raw CUDA), you declare a layout on each buffer and the compiler generates the correct address arithmetic, TMA descriptors, and LD_TMEM instructions automatically.
+These kernels use **Axe Layout** ([Hou et al., 2026](https://arxiv.org/abs/2601.19092)), a hardware-aware layout abstraction that maps logical tensor coordinates to named physical axes. Instead of manually computing memory addresses or thread-to-element mappings (as in raw CUDA), you declare a layout on each buffer and the compiler generates the correct address arithmetic, TMA descriptors, and TMEM load instructions automatically.
 
 **Syntax.** The layout spec `S[shape : stride@axis]` reads as "map each dimension to a named hardware axis":
 
@@ -138,7 +148,7 @@ If no `@axis` is given (just a plain number), it defaults to the memory axis `m`
 
 - **SMEM layout**: `tma_shared_layout` creates a swizzled layout for bank-conflict-free access. You don't need to understand swizzle internals — just call this helper function with your dtype, swizzle mode, and buffer shape.
 - **TMEM layout**: `TLane` and `TCol` are Blackwell Tensor Memory's native 2D addressing axes. Declaring this layout tells the compiler the buffer lives in TMEM.
-- **Register view**: `axis_tid_in_wg` means "distribute rows across the 128 threads in a warpgroup." When you write `Tx.copy(Dreg_wg, tmem)`, the compiler matches `tid_in_wg` to `TLane` and generates the correct LD_TMEM instructions.
+- **Register view**: `axis_tid_in_wg` means "distribute rows across the 128 threads in a warpgroup." When you write `Tx.copy(Dreg_wg, tmem)`, the compiler matches `tid_in_wg` to `TLane` and generates the correct TMEM load instructions.
 
 
 ---
@@ -211,6 +221,8 @@ If tests fail intermittently, check `nvidia-smi` — another process may be usin
 ```
 gemm_kernels.py          # Skeleton — your implementation goes here
 utils.py                 # Helpers: prepare_data, compile_and_run, verify, benchmark
+run_modal.py             # Run tests on cloud B200 via Modal
+inspect_cuda.py          # View generated CUDA/PTX code for any step
 tests/
   conftest.py            # Pytest GPU selection fixture
   test_step01.py         # Step 1 test
@@ -256,16 +268,18 @@ The kernel structure is:
 
 1. **Allocate shared memory**: Use `Tx.PoolAllocator()` to allocate `Asmem` (128x64), `Bsmem` (128x64), an mbarrier, and a TMEM address slot.
 2. **Allocate TMEM**: `Tx.ptx.tcgen05.alloc(addr, n_cols=512, cta_group=1)` — only warp 0 does this.
-3. **Fence + sync**: `fence.proxy_async("shared::cta")`, `fence.mbarrier_init()`, `cta_sync()` — ensure all allocations are visible.
-4. **Load data**: `Tx.copy(Asmem[:,:], A[m_st:m_st+128, 0:64])` — all threads cooperate to copy.
-5. **MMA**: Elect one thread via `Tx.ptx.elect_sync()`, call `Tx.gemm_async(tmem[:,:128], Asmem, Bsmem, accum=False, dispatch="tcgen05", cta_group=1)`, then `tcgen05.commit(mma_bar, cta_group=1)`.
-6. **Wait for MMA**: `mbarrier.try_wait(mma_bar, phase)`.
-7. **Writeback**: Read TMEM to registers (`Tx.copy(Dreg_wg, tmem)` at warpgroup scope), cast fp32 -> fp16, write to GMEM.
+3. **Fence + sync**: `fence.proxy_async("shared::cta")` flushes pending shared memory writes, `fence.mbarrier_init()` ensures the mbarrier initialization is visible, and `cta_sync()` synchronizes all threads (like `__syncthreads`). This sequence is needed after initializing barriers and TMEM so that all threads see the results before proceeding.
+4. **Load data**: Use `with Tx.cta():` so all 128 threads cooperate on the copy. Then `cta_sync()` + `fence.after_thread_sync()` before MMA (see Synchronization Rules above).
+5. **MMA**: Only warp 0's elected thread issues MMA and commit: `if warp_id == 0:` then `with Tx.thread(parent="warp")[Tx.ptx.elect_sync()]:`.
+6. **Wait for MMA**: `Tx.ptx.mbarrier.try_wait(mma_bar, phase)`. Place this **outside** `if warp_id == 0:` — all threads must wait here, because the subsequent TMEM read requires all 128 threads in the warpgroup to participate after MMA completes.
+7. **Writeback**: Two scopes:
+   - `with Tx.warpgroup():` — read TMEM to registers (all 128 threads cooperate on TMEM load)
+   - `with Tx.thread():` — cast fp32 -> fp16, then write to GMEM. Each of the 128 threads writes one row. A warpgroup has 4 warps of 32 threads, so thread's row is `m_st + warp_id * 32 + lane_id` (warp 0 handles rows 0-31, warp 1 handles rows 32-63, etc.).
 8. **Deallocate TMEM**: `tcgen05.relinquish_alloc_permit` + `tcgen05.dealloc`.
 
 **Implementation hints:**
 - `accum=False` (not `0`) for the first MMA — TIRX requires a boolean.
-- `Tx.copy` at `Tx.cta()` scope means all threads in the CTA cooperate on the copy.
+- Register buffers: `Tx.alloc_local((BLK_N,), dtype)` allocates a 1D per-thread buffer. Use `.view(128, BLK_N, layout=...)` to create a 2D warpgroup view for TMEM reads.
 - **Layouts** (see Axe Layout section above):
   - SMEM: `A_layout = tma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM, (BLK_M, BLK_K))`
   - TMEM: `TileLayout(S[(128, 512) : (1@TLane, 1@TCol)])`
@@ -290,7 +304,7 @@ The mbarrier is reused across iterations. After each wait, the phase flips (0 ->
 
 **Implementation hints:**
 - Loop: `for k in range(K_TILES)` where `K_TILES = K // BLK_K`.
-- Load: `Tx.copy(Asmem, A[m_st:m_st+128, k*64:(k+1)*64])`.
+- Load: `Tx.copy(Asmem, A[:, k*64:(k+1)*64])`.
 - MMA: `accum = (k != 0)` — first iteration is False, rest are True.
 - Phase flip: `phase_mma = phase_mma ^ 1` after each wait.
 
@@ -335,20 +349,19 @@ The synchronization flow is:
 
 ```mermaid
 sequenceDiagram
-    participant T0 as Thread 0
+    participant T0 as Elected Thread
     participant TMA as TMA Hardware
     participant Bar as mbarrier
-    participant All as All Threads
     participant MMA as tcgen05 MMA
 
     T0->>TMA: copy_async(Asmem, A[...])
     T0->>TMA: copy_async(Bsmem, B[...])
     T0->>Bar: arrive.expect_tx(bytes)
     TMA-->>Bar: auto-arrive when transfer done
-    All->>Bar: try_wait(phase)
-    Bar-->>All: phase complete
-    All->>All: tcgen05.fence.after_thread_sync()
-    All->>MMA: gemm_async(tmem, Asmem, Bsmem)
+    T0->>Bar: try_wait(phase)
+    Bar-->>T0: phase complete
+    T0->>T0: fence.after_thread_sync()
+    T0->>MMA: gemm_async(tmem, Asmem, Bsmem)
 ```
 
 The `expect_tx` call tells the mbarrier how many bytes the TMA will transfer. When TMA finishes transferring exactly that many bytes, the barrier automatically transitions.
@@ -356,18 +369,23 @@ The `expect_tx` call tells the mbarrier how many bytes the TMA will transfer. Wh
 **Writeback with TMA store:**
 
 Instead of writing directly from registers to GMEM (slow, uncoalesced), we use TMA store:
-1. Read TMEM -> registers (LD_TMEM)
+1. Read TMEM -> registers
 2. Cast fp32 -> fp16 in registers
 3. Write registers -> Dsmem (shared memory, with swizzled layout)
 4. TMA store: `Tx.copy_async(D[...], Dsmem[:,:], dispatch="tma")` — one thread issues TMA store
+5. Wait for TMA store completion: `Tx.ptx.cp_async.bulk.commit_group()` + `Tx.ptx.cp_async.bulk.wait_group(0)`
+
+Note: TMA **loads** signal completion via mbarrier (byte counting). TMA **stores** use a different mechanism — commit group + wait group — because there is no consumer that needs to be notified; you just need to ensure the store finishes before reusing the Dsmem buffer.
 
 This requires allocating a `Dsmem` buffer with a TMA-compatible swizzled layout (`tma_shared_layout` — same helper used for Asmem/Bsmem).
 
 **Implementation hints:**
-- Only one thread issues TMA: `with Tx.thread(parent="warpgroup")[tid == 0]:`
+- Use `@Tx.inline` to define helper functions (e.g., `tma_load`, `mma`) inside the kernel. These are inlined at compile time and can capture outer variables like `Asmem`, `tma_bar`, etc.
+- Only one thread issues TMA and MMA. You can use `if warp_id == 0:` with `elect_sync()` (as in step 1), or compute `tid = Tx.meta_var(warp_id * 32 + lane_id)` and use `with Tx.thread(parent="warpgroup")[tid == 0]:`.
 - TMA config: `{"dispatch": "tma", "cta_group": 1, "mbar": tma_bar.ptr_to([0])}`
 - Byte count: `(BLK_M * BLK_K + BLK_N * BLK_K) * 2` (fp16 = 2 bytes)
 - Use `Tx.ptx.mbarrier.init(tma_bar.ptr_to([0]), 1)` — 1 expected arrival from the expect_tx call.
+
 
 **Test:** `pytest tests/test_step04.py -xvs`
 
@@ -385,37 +403,11 @@ This requires allocating a `Dsmem` buffer with a TMA-compatible swizzled layout 
 
 Without pipelining, the kernel alternates between loading and computing:
 
-```mermaid
-gantt
-    title No Pipeline
-    dateFormat X
-    axisFormat %s
-    section TMA
-        Load k0 : 0, 2
-        Load k1 : 4, 6
-        Load k2 : 8, 10
-    section MMA
-        Compute k0 : 2, 4
-        Compute k1 : 6, 8
-        Compute k2 : 10, 12
-```
+![No Pipeline](images/no_pipeline.png)
 
 With a 2-stage pipeline, we overlap loading the next tile with computing the current one:
 
-```mermaid
-gantt
-    title PIPE_DEPTH=2
-    dateFormat X
-    axisFormat %s
-    section TMA
-        Load k0 : 0, 2
-        Load k1 : 2, 4
-        Load k2 : 4, 6
-    section MMA
-        Compute k0 : 2, 4
-        Compute k1 : 4, 6
-        Compute k2 : 6, 8
-```
+![PIPE_DEPTH=2](images/pipe_depth2.png)
 
 This requires double-buffered SMEM: `Asmem[0, :, :]` and `Asmem[1, :, :]`. While the MMA reads from stage 0, TMA loads into stage 1, and vice versa.
 
@@ -512,14 +504,20 @@ tma_phase.init(is_producer=True)
 tma_phase.move_to_next_stage()  # Advance to next stage
 ```
 
+**`is_producer` controls the initial phase.** Barriers start at phase 0. `try_wait(bar, phase)` blocks until the barrier's phase equals the given phase.
+- `is_producer=True` → initial phase = 1. The first `wait(stage, phase=1)` sees barrier phase 0 ≠ 1, so it **passes immediately** — the producer can write without waiting (buffers start empty).
+- `is_producer=False` → initial phase = 0. The first `wait(stage, phase=0)` sees barrier phase 0 == 0, so it **blocks** — the consumer waits for the producer to fill data first.
+
+Getting this wrong causes either deadlock (producer waits for consumer who waits for producer) or data corruption (consumer reads before producer writes).
+
 `TCGen05Bar.arrive` takes a `cta_mask` parameter. For non-cluster kernels (single CTA), use `cta_mask=1`. For cluster kernels (step 9+), use `cta_mask=3` to multicast the signal to both CTAs.
 
 **Epilogue (writeback) structure:**
-1. Wait for MMA completion: `mma2ld.wait`
-2. Read TMEM to registers in chunks of `TMEM_LD_N=8` columns (hardware bandwidth limit)
+1. Wait for MMA completion: `mma2ld.wait`, then `fence.after_thread_sync()` to make TMEM data visible
+2. Read TMEM to registers (can be done in chunks to reduce register pressure)
 3. Cast fp32 -> fp16, accumulate into `Dreg_16b`
 4. Signal MMA that TMEM is free: `ld2mma.arrive`
-5. Write `Dreg_16b` to `Dsmem` in chunks of `EPI_N=64`, TMA store each chunk to GMEM
+5. Write `Dreg_16b` to `Dsmem`, then TMA store to GMEM. You can use a smaller `Dsmem` (e.g., `EPI_N=64` columns) and loop over chunks to save shared memory.
 
 **Implementation hints:**
 - `WG_NUMBER = 2`, `PIPE_DEPTH = 2`
@@ -601,7 +599,7 @@ flowchart TB
     end
 ```
 
-The effective output tile per CTA becomes 128 x 256 (instead of 128 x 128), and the cluster tile is 256 x 256. Each CTA loads its own A tile (different M rows) and its own B tile (different N columns). The tcgen05 MMA with `cta_group=2` cross-reads both CTAs' B via `shared::cluster`, producing a 256-column output.
+Although only CTA-0's elected thread issues the MMA instruction, **both CTAs' Tensor Cores compute simultaneously**. Each CTA reads A from its own SMEM (different M rows). For B, both CTAs' SMEM is mapped into a shared `shared::cluster` address space — the MMA hardware reads B from both CTAs' SMEM at the same offset, concatenating them into 256 columns. Each CTA produces a 128 x 256 output in its own TMEM, and the cluster tile is 256 x 256.
 
 **New concepts:**
 - **Cluster CTA ID**: `cbx, cby = Tx.cta_id([CTA_GROUP, 1], parent="cluster")` — position within the cluster.
@@ -619,6 +617,9 @@ With `cta_group=2`, `Tx.gemm_async` outputs `MMA_N = BLK_N * CTA_GROUP = 256` co
 - `CTA_GROUP = 2`, `MMA_N = BLK_N * CTA_GROUP`
 - `m_st` and `n_st` account for cluster position (cbx)
 - `ld2mma.init(128 * CTA_GROUP)` — both CTAs' writeback WGs arrive
+- Tile scheduler: `num_m_tiles=M//256`, `num_n_tiles=N//256`, `num_clusters=SM_COUNT//2`, `tile_scheduler.init(bx // CTA_GROUP)`
+- `tcgen05.alloc` and `tcgen05.dealloc` must use `cta_group=2`
+- TMA arrive byte count must include both CTAs: `CTA_GROUP * (BLK_M * BLK_K + BLK_N * BLK_K) * DTYPE_SIZE`
 
 **Test:** `pytest tests/test_step09.py -xvs`
 
@@ -652,6 +653,10 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 - MMA output offset: `tmem[:, warp_id * MMA_N : warp_id * MMA_N + MMA_N]`
 - Writeback WG offset: `wg_id * MMA_N`
 - `mma2tma.init(NUM_CONSUMER)`, `mma2ld.init(1)` per consumer, `ld2mma.init(128 * CTA_GROUP)` per consumer
+- `mma2ld` and `ld2mma` have `depth=NUM_CONSUMER`. Use `warp_id` / `wg_id` as the stage index (not `PipelineState.stage`) so each consumer uses its own barrier slot: `mma2ld.arrive(warp_id, ...)`, `mma2ld.wait(wg_id, ...)`
+- Writeback **must** use chunked EPI_N (e.g., 64 or smaller) — reading all 256 TMEM columns at once exceeds register capacity
+- Tile scheduler: `num_m_tiles=M // 256 // NUM_CONSUMER` — cluster tile is now 512x256
+- TMA arrive bytes: `CTA_GROUP * (NUM_CONSUMER * BLK_M * BLK_K + BLK_N * BLK_K) * DTYPE_SIZE` — 2 A blocks + 1 B block per CTA
 
 **Test:** `pytest tests/test_step10.py -xvs`
 
@@ -665,6 +670,11 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 |-----|-------------|
 | `Tx.prim_func(tirx=True)` | Declare a TIRX primitive function |
 | `Tx.kernel()` | Kernel execution scope |
+| `with Tx.cta():` | Scope: all threads in the CTA execute this block |
+| `with Tx.warpgroup():` | Scope: all 128 threads in the warpgroup execute this block |
+| `with Tx.warp():` | Scope: all 32 threads in the warp execute this block |
+| `with Tx.thread():` | Scope: each thread executes independently |
+| `with Tx.thread(parent="warp")[cond]:` | Scope: only threads where `cond` is true execute |
 | `Tx.cta_id(shape, parent=...)` | CTA index in grid or cluster |
 | `Tx.warpgroup_id(shape, parent=...)` | Warpgroup index within CTA |
 | `Tx.warp_id(shape, parent=...)` | Warp index within warpgroup |
@@ -680,9 +690,13 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 | `pool.move_base_to(offset)` | Set next allocation offset (for overlapping buffers) |
 | `pool.commit()` | Finalize all allocations |
 | `Tx.alloc_local(shape, dtype)` | Allocate per-thread register buffer |
-| `buf.view(shape, layout=...)` | Create a view of a register buffer with a different layout |  
+| `buf.view(shape, layout=...)` | Create a view of a register buffer with a different layout |
 | `Tx.decl_buffer(shape, dtype, scope="tmem", ...)` | Declare a TMEM buffer |
+| `Tx.address_of(buf)` | Get address of a buffer (used for TMEM alloc) |
+| `buf.ptr_to([idx])` | Get pointer to the idx-th element (used for mbarrier access) |
+| `tma_shared_layout(dtype, SwizzleMode, shape)` | Create TMA-compatible swizzled layout for SMEM buffers |
 | `Tx.ptx.tcgen05.alloc(addr, n_cols, cta_group)` | Allocate TMEM |
+| `Tx.ptx.tcgen05.relinquish_alloc_permit(cta_group)` | Release TMEM allocation permit (call before dealloc) |
 | `Tx.ptx.tcgen05.dealloc(addr, n_cols, cta_group)` | Deallocate TMEM |
 
 ### Data Movement
@@ -693,6 +707,15 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 | `Tx.copy_async(dst, src, dispatch="tma", ...)` | TMA async copy (load or store) |
 | `Tx.cast(dst, src)` | Element-wise type cast |
 | `Tx.gemm_async(C, A, B, accum, dispatch="tcgen05", cta_group)` | tcgen05 MMA |
+
+### Control Flow
+
+| API | Description |
+|-----|-------------|
+| `for i in Tx.unroll(N):` | Explicit unrolled loop with `i` usable for buffer slicing |
+| `for i in Tx.serial(N):` | Sequential loop (not unrolled), `i` is a TIR variable |
+| `Tx.meta_var(expr)` | Compile-time alias for an expression (required for buffer slice offsets) |
+| `@Tx.inline` | Decorator for inline helper functions within the kernel |
 
 ### Synchronization
 
@@ -705,7 +728,10 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 | `Tx.ptx.tcgen05.fence.after_thread_sync()` | Fence before accessing TMEM after sync |
 | `Tx.ptx.fence.proxy_async("shared::cta")` | Shared memory fence |
 | `Tx.ptx.fence.mbarrier_init()` | Fence after mbarrier initialization |
+| `Tx.ptx.cp_async.bulk.commit_group()` | Commit pending TMA store operations |
+| `Tx.ptx.cp_async.bulk.wait_group(n)` | Wait until at most `n` TMA store groups remain in flight |
 | `Tx.cuda.cta_sync()` | CTA-wide barrier (like `__syncthreads`) |
+| `Tx.cuda.warpgroup_sync(barrier_id)` | Warpgroup-level barrier (barrier_id differentiates multiple barriers) |
 | `Tx.cuda.cluster_sync()` | Cluster-wide barrier |
 
 ### High-Level Abstractions
@@ -715,7 +741,17 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 | `TMABar(pool, depth, name)` | TMA barrier array (auto-arrive via byte counting) |
 | `TCGen05Bar(pool, depth, name)` | tcgen05 barrier array (auto-arrive via commit) |
 | `MBarrier(pool, depth, name)` | Manual mbarrier array (threads arrive explicitly) |
+| `bar.init(count)` | Initialize barrier with expected arrival count |
+| `bar.wait(stage, phase)` | Wait for barrier at given stage and phase |
+| `TMABar.arrive(stage, bytes)` | Arrive with expected byte count (TMA load) |
+| `TCGen05Bar.arrive(stage, cta_group=, cta_mask=)` | Arrive via tcgen05 commit |
+| `MBarrier.arrive(stage, cta_id=, pred=)` | Thread-level arrive |
+| `bar.ptr_to([stage])` | Get pointer to barrier at given stage |
+| `TMABar.remote_view(cta_id)` | Access another CTA's barrier (for cross-CTA signaling) |
 | `PipelineState(name, depth)` | Manages pipeline stage index and phase |
+| `PipelineState.init(is_producer=)` | Initialize phase tracking (producer starts ready, consumer starts waiting) |
+| `PipelineState.stage` / `.phase` | Current stage index and phase value |
+| `PipelineState.move_to_next_stage()` | Advance to next pipeline stage |
 | `ClusterPersistentScheduler2D(...)` | L2-friendly tile scheduler for persistent kernels |
 
 ---
@@ -727,7 +763,11 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 - **Fence API**: Use `Tx.ptx.fence.proxy_async("shared::cta")` — positional argument, not keyword `scope=`.
 - **GPU flakiness**: If tests fail intermittently, check `nvidia-smi` and switch to an idle GPU.
 - **Dsmem overlap**: `pool.move_base_to(1024)` before Dsmem allows it to overlap with Asmem/Bsmem (reusing memory after MMA is done).
-- **`alloc_local` vs `decl_buffer`**: Use `Tx.alloc_local` for register buffers. `Tx.decl_buffer` is only for hardware-managed memory like TMEM. To do cross-thread operations, create a view with `.view()` — but use the original `alloc_local` buffer (not the view) for thread-level operations like `Tx.cast`.  
+- **Do NOT call `cta_sync()` inside an elected-thread scope** (e.g., inside `Tx.thread()[elect_sync()]`). Only one thread is executing — `cta_sync()` requires all threads to participate, so it will deadlock.
+- **`alloc_local` vs `decl_buffer`**: Use `Tx.alloc_local` for register buffers. `Tx.decl_buffer` is only for hardware-managed memory like TMEM. To do cross-thread operations, create a view with `.view()` — but use the original `alloc_local` buffer (not the view) for thread-level operations like `Tx.cast`.
+- **TMA store must be followed by `commit_group()` + `wait_group(0)`**: TMA store is asynchronous — without waiting, the next loop iteration may overwrite Dsmem before the store finishes reading it.
+- **`fence.after_thread_sync()` required before reading TMEM**: After `mma2ld.wait()` (or any mbarrier wait), you must call `fence.after_thread_sync()` before reading TMEM. Without it, the TMEM data from MMA may not be visible to the reading threads.
+- **Constants must be defined outside `@Tx.prim_func`**: Variables like `EPI_N`, `TMEM_LD_N`, `MMA_N` must be Python constants defined alongside `BLK_M`, `BLK_K`, etc. Variables assigned inside the kernel function become TIR dynamic variables, which causes errors when used in buffer slicing.
 
 ---
 
