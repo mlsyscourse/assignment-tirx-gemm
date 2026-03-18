@@ -41,29 +41,34 @@ def hgemm_v1(M, N, K):
 
             # --- Shared memory allocation ---
             pool = Tx.PoolAllocator()
-            tmem_addr = pool.alloc((1,), "uint32")
-            mma_bar = pool.alloc((1,), "uint64", align=8)
-            pool.move_base_to(1024)
+            tmem_addr = pool.alloc((1,), "uint32")    # Slot to store the TMEM base address returned by tcgen05.alloc
+            mma_bar = pool.alloc((1,), "uint64", align=8)  # mbarrier for MMA completion signaling
+            pool.move_base_to(1024)                   # Skip to offset 1024 so data buffers don't overlap with barriers
             Asmem = pool.alloc((BLK_M, BLK_K), a_type, layout=A_layout)
             Bsmem = pool.alloc((BLK_N, BLK_K), b_type, layout=B_layout)
-            pool.commit()
+            pool.commit()                             # Finalize all shared memory allocations
 
             # --- Barrier + TMEM init (warp 0 only) ---
             if warp_id == 0:
                 if lane_id == 0:
+                    # Init mbarrier with count=1 (one arrival expected). ptr_to([0]) gets pointer to the 0th element.
                     Tx.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
+                # Allocate 512 TMEM columns. address_of() passes the address where the HW writes the TMEM base.
                 Tx.ptx.tcgen05.alloc(Tx.address_of(tmem_addr), n_cols=512, cta_group=1)
 
+            # Flush shared memory writes, ensure mbarrier init is visible, then sync all threads
             Tx.ptx.fence.proxy_async("shared::cta")
             Tx.ptx.fence.mbarrier_init()
             Tx.cuda.cta_sync()
 
+            # Declare a logical view of the allocated TMEM (allocated_addr=0 means use the base from tcgen05.alloc)
             tmem = Tx.decl_buffer((128, 512), "float32", scope="tmem", allocated_addr=0,
                                   layout=TileLayout(S[(128, 512) : (1@TLane, 1@TCol)]))
 
-            m_st = Tx.meta_var(bx * BLK_M)
-            n_st = Tx.meta_var(by * BLK_N)
+            m_st = Tx.meta_var(bx * BLK_M)           # Compile-time alias for tile row offset
+            n_st = Tx.meta_var(by * BLK_N)           # Compile-time alias for tile col offset
 
+            # TIR requires explicit type declaration for mutable variables
             phase_mma: Tx.int32
             phase_mma = 0
 
@@ -263,7 +268,8 @@ def hgemm_v4(M, N, K):
             # TODO: Main loop (elected thread of warp 0):
             #   for k in range(K_TILES): tma_load(k*BLK_K); mma(k != 0)
 
-            # TODO: Writeback TMEM → RF → GMEM
+            # TODO: Writeback TMEM → RF → SMEM → TMA store → GMEM
+            # You will need a Dsmem buffer with tma_shared_layout for TMA store.
 
             if warp_id == 0:
                 Tx.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
@@ -371,8 +377,8 @@ def hgemm_v7(M, N, K):
     MMA_N = BLK_N
     K_TILES = K // BLK_K
     PIPE_DEPTH = 2
-    EPI_N = 64
-    TMEM_LD_N = 8
+    EPI_N = 64       # Optional, can be any value that divides MMA_N (e.g., 64, 128)
+    TMEM_LD_N = 8    # Optional, can be any value that divides MMA_N (e.g., 8, 16, 128)
     WG_NUMBER = 2
 
     A_layout = tma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM, (PIPE_DEPTH, BLK_M, BLK_K))
@@ -400,7 +406,7 @@ def hgemm_v7(M, N, K):
             # WG0: writeback loop
             #   mma2ld.wait → TMEM→RF→SMEM→GMEM (TMA store) → ld2mma.arrive
             #
-            # Note: use cta_mask=1 for TCGen05Bar.arrive (1-CTA kernel).
+            # Note: use cta_mask=1 for TCGen05Bar.arrive (non-cluster kernel).
             pass
 
     return kernel
