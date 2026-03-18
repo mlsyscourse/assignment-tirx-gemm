@@ -2,9 +2,9 @@
 
 In this assignment, you will progressively build a high-performance FP16 GEMM kernel for NVIDIA Blackwell (SM100) GPUs using TVM/TIRX. Starting from a minimal single-tile kernel, you will incrementally add optimizations — K-loop accumulation, spatial tiling, TMA async loads, software pipelining, persistent kernels, warp specialization, deeper pipelines, multi-CTA clusters, and multi-consumer parallelism — until you arrive at a fully optimized kernel that matches the structure of production-grade implementations.
 
-**Prerequisites**: Familiarity with CUDA programming concepts (threads, warps, shared memory, synchronization). No prior experience with TIRX or Blackwell-specific features is required — this tutorial covers everything you need.
+**Prerequisites**: Familiarity with CUDA programming concepts (threads, warps, shared memory, synchronization).
 
-Please read the [slides](https://mlsyscourse.org/slides/tirx-gemm/) for the introduction and guidance to TIRX and this assignment.
+Please read the [slides](https://mlsyscourse.org/slides/tirx-gemm/) for the introduction and guidance to TIRX and this assignment. Reading and fully understanding them beforehand is **strongly recommended**, as they provide important context for the assignment.
 
 ---
 
