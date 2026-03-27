@@ -652,8 +652,10 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 - MMA warp `warp_id` selects which A block: `Asmem[stage, warp_id, :, :]`
 - MMA output offset: `tmem[:, warp_id * MMA_N : warp_id * MMA_N + MMA_N]`
 - Writeback WG offset: `wg_id * MMA_N`
-- `mma2tma.init(NUM_CONSUMER)`, `mma2ld.init(1)` per consumer, `ld2mma.init(128 * CTA_GROUP)` per consumer
-- `mma2ld` and `ld2mma` have `depth=NUM_CONSUMER`. Use `warp_id` / `wg_id` as the stage index (not `PipelineState.stage`) so each consumer uses its own barrier slot: `mma2ld.arrive(warp_id, ...)`, `mma2ld.wait(wg_id, ...)`
+- `mma2tma.init(NUM_CONSUMER)` — each stage expects 2 arrivals (one per MMA warp)
+- `mma2ld = TCGen05Bar(pool, NUM_CONSUMER, ...)` and `ld2mma = MBarrier(pool, NUM_CONSUMER, ...)` — one shared object each with `depth=NUM_CONSUMER` (2 slots), **not** separate objects per consumer. Use `warp_id` / `wg_id` as the slot index (not `PipelineState.stage`): `mma2ld.arrive(warp_id, ...)`, `mma2ld.wait(wg_id, ...)`
+- `mma2ld.init(1)` — each slot expects 1 arrival (one MMA warp)
+- `ld2mma.init(128 * CTA_GROUP)` — each slot expects 256 arrivals (all writeback WG threads across both CTAs)
 - Writeback **must** use chunked EPI_N (e.g., 64 or smaller) — reading all 256 TMEM columns at once exceeds register capacity
 - Tile scheduler: `num_m_tiles=M // 256 // NUM_CONSUMER` — cluster tile is now 512x256
 - TMA arrive bytes: `CTA_GROUP * (NUM_CONSUMER * BLK_M * BLK_K + BLK_N * BLK_K) * DTYPE_SIZE` — 2 A blocks + 1 B block per CTA
