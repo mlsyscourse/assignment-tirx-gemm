@@ -775,9 +775,257 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 
 ## Debugging: Inspect Generated CUDA Source
 
-We offer ways for you to generate CUDA/PTX code to debugif you are interested.
-You can use `inspect_cuda.py` to view the generated code for any kernel step. 
-See the file header for usage details.
+Use `inspect_cuda.py` to view the CUDA code the compiler generates from your TIRX kernel. This is the most effective way to debug deadlocks, crashes, and wrong results — it shows you exactly which threads execute which instructions.
+
+### Basic Usage
+
+```bash
+python inspect_cuda.py 7              # Step 7, size 1024 (default)
+python inspect_cuda.py 9 2048         # Step 9, size 2048
+python inspect_cuda.py 7 > v7.cu      # Save to file
+
+# Search for specific instructions:
+python inspect_cuda.py 7 | grep tcgen05_alloc
+python inspect_cuda.py 7 | grep mbarrier_init
+python inspect_cuda.py 7 | grep -B5 -A5 "tcgen05_alloc"
+```
+
+### Reading the Generated Code
+
+The generated CUDA kernel starts with a function like:
+
+```c
+__global__ void __launch_bounds__(256) kernel_kernel(...) {
+  // warp_id_in_cta: 0-7 for 2 warpgroups × 4 warps
+  int warp_id_in_cta = __shfl_sync(0xffffffff, (((int)threadIdx.x) >> 5), 0, 32);
+  extern __shared__ uchar s_buf_w_offset_ptr[];  // shared memory pool
+  ...
+```
+
+Key mappings from TIRX to generated CUDA:
+
+| TIRX | Generated CUDA |
+|------|---------------|
+| `wg_id == 0` | `(warp_id_in_cta >> 2) == 0` |
+| `wg_id == 1` | `(warp_id_in_cta >> 2) == 1` |
+| `warp_id == 0` | `(warp_id_in_cta % 4) == 0` or `(warp_id_in_cta & 3) == 0` |
+| `warp_id == 3` | `(warp_id_in_cta & 3) == 3` |
+| `lane_id == 0` | `(((int)threadIdx.x) % 32) == 0` |
+| `.init()` internal guard | `((int)threadIdx.x) < 1` (absolute CTA thread 0) |
+| `elect_sync()` | `tvm_builtin_elect_one_sync_op()` |
+
+### Example: Correct Step 7 Structure
+
+A correctly compiled Step 7 kernel has this structure (from the reference implementation):
+
+```c
+// ---- Barrier inits: threadIdx.x < 1 guard (CTA thread 0 only) ----
+if (((int)threadIdx.x) < 1) {
+  tvm_builtin_ptx_mbarrier_init(&s_buf[4], 1);   // tma2mma slot 0
+  tvm_builtin_ptx_mbarrier_init(&s_buf[5], 1);   // tma2mma slot 1
+}
+if (((int)threadIdx.x) < 1) {
+  tvm_builtin_ptx_mbarrier_init(&s_buf[6], 1);   // mma2tma slot 0
+  tvm_builtin_ptx_mbarrier_init(&s_buf[7], 1);   // mma2tma slot 1
+}
+if (((int)threadIdx.x) < 1) {
+  tvm_builtin_ptx_mbarrier_init(&s_buf[8], 1);   // mma2ld
+}
+if (((int)threadIdx.x) < 1) {
+  tvm_builtin_ptx_mbarrier_init(&s_buf[9], 128); // ld2mma
+}
+
+// ---- TMEM alloc: WG0 warp0 (all 32 lanes, no lane guard) ----
+if ((warp_id_in_cta >> 2) == 0) {       // wg_id == 0
+  if ((warp_id_in_cta % 4) == 0) {      // warp_id == 0
+    tvm_builtin_ptx_tcgen05_alloc_cta_group_1(&s_buf[0], 512);
+  }
+}
+
+// ---- Fences + sync ----
+tvm_builtin_ptx_fence_proxy_async_shared_cta();
+tvm_builtin_ptx_fence_mbarrier_init();
+tvm_builtin_cuda_cta_sync();
+
+// ---- Pipeline phase init ----
+tma_phase_ptr[0] = 1;     // producer: starts at phase 1 (first wait passes)
+mma_phase_ptr[0] = 0;     // consumer: starts at phase 0 (first wait blocks)
+ld_phase_ptr[0] = 1;      // producer
+wb_phase_ptr[0] = 0;      // consumer
+
+// ---- WG1: TMA warp (warp 3) ----
+if ((warp_id_in_cta >> 2) == 1) {       // wg_id == 1
+  if ((warp_id_in_cta & 3) == 3) {      // warp_id == 3
+    if (tvm_builtin_elect_one_sync_op()) {
+      while (valid) {
+        for (int k = 0; k < 16; ++k) {  // K_TILES iterations
+          mbarrier_wait(mma2tma[stage], phase);   // wait for SMEM free
+          cp_async_bulk_tensor(Asmem[stage], ...); // TMA load A
+          cp_async_bulk_tensor(Bsmem[stage], ...); // TMA load B
+          mbarrier_arrive_expect_tx(tma2mma[stage], 32768); // signal MMA
+          stage = (stage + 1) % 2;
+          if (stage == 0) phase ^= 1;
+        }
+        next_tile();
+      }
+    }
+  } else {
+    // ---- WG1: MMA warp (warp 0) ----
+    if ((warp_id_in_cta % 4) == 0) {    // warp_id == 0
+      if (tvm_builtin_elect_one_sync_op()) {
+        while (valid) {
+          mbarrier_wait(ld2mma, ld_phase);         // wait for TMEM free
+          for (int k = 0; k < 16; ++k) {           // K_TILES iterations
+            mbarrier_wait(tma2mma[stage], phase);   // wait for data
+            tcgen05_fence_after_thread_sync();
+            tcgen05_mma(...);                       // MMA
+            tcgen05_commit(mma2tma[stage]);          // signal TMA
+            stage = (stage + 1) % 2;
+            if (stage == 0) phase ^= 1;
+          }
+          tcgen05_commit(mma2ld);                   // signal writeback
+          next_tile();
+        }
+      }
+    }
+  }
+} else {
+  // ---- WG0: Writeback ----
+  if ((warp_id_in_cta >> 2) == 0) {     // wg_id == 0
+    while (valid) {
+      mbarrier_wait(mma2ld, wb_phase);             // wait for MMA done
+      tcgen05_ld(...);                              // read TMEM → registers
+      mbarrier_arrive_remote(ld2mma, 0, true);     // signal MMA: TMEM free
+      // ... cast, write to Dsmem, TMA store ...
+      next_tile();
+    }
+  }
+}
+
+// ---- Cleanup ----
+cta_sync();
+if ((warp_id_in_cta % 4) == 0) {       // warp_id == 0 (all 32 lanes)
+  tcgen05_relinquish_alloc_permit();
+  tcgen05_dealloc(s_buf[0], 512);
+}
+```
+
+### Debugging Deadlocks
+
+**Step 1: Confirm it's a deadlock (not a crash)**
+
+```bash
+# Deadlock: hangs for ~30s then "unspecified launch failure"
+# Crash (XID 43): fails instantly
+CUDA_LAUNCH_BLOCKING=1 python -m pytest tests/test_step07.py -xvs -k "1024"
+```
+
+**Step 2: Reduce to smallest failing size**
+
+If 1024 passes but 2048+ deadlocks, the bug likely involves pipeline state drift across tiles.
+
+**Step 3: Verify barrier arrival counts match init counts**
+
+| Barrier | `init(count)` | Who arrives | How many |
+|---------|---------------|-------------|----------|
+| `tma2mma` (TMABar) | `init(1)` | TMA warp via `arrive(stage, bytes)` | 1 |
+| `mma2tma` (TCGen05Bar) | `init(1)` | MMA warp via `arrive(stage, cta_group, cta_mask)` | 1 |
+| `mma2ld` (TCGen05Bar) | `init(1)` | MMA warp via `arrive(0, cta_group, cta_mask)` | 1 |
+| `ld2mma` (MBarrier) | `init(128)` | All WG0 threads via `arrive(0, cta_id, pred)` | 128 |
+
+Common mistakes:
+- `ld2mma.init(128)` but `arrive` guarded by `if warp_id == 0: if lane_id == 0:` → only 1 arrival
+- Step 10: `mma2ld.init(NUM_CONSUMER)` when each slot only gets 1 arrival → should be `init(1)`
+
+**Step 4: Check barrier inits actually execute**
+
+The `.init()` wrapper uses `threadIdx.x < 1` internally. If you nest it inside `if wg_id == 1:`, no thread satisfies both conditions. Generate code and verify:
+
+```bash
+python inspect_cuda.py 7 | grep -B10 "mbarrier_init"
+```
+
+Buggy code produces:
+```c
+if ((warp_id_in_cta >> 2) == 1) {     // wg_id == 1 → threadIdx 128-255
+  if ((warp_id_in_cta % 4) == 0) {
+    if (((int)threadIdx.x) < 1) {      // threadIdx.x < 1 → only thread 0
+      mbarrier_init(...);              // NEVER REACHED — thread 0 is in WG0!
+    }
+  }
+}
+```
+
+Correct code produces:
+```c
+if (((int)threadIdx.x) < 1) {         // at top level, no wg_id guard
+  mbarrier_init(...);                  // thread 0 executes this
+}
+```
+
+**Step 5: Verify TMA and MMA iterate the same number of K tiles**
+
+```bash
+python inspect_cuda.py 7 | grep "for (int k"
+```
+
+Both loops must show `k < 16` (for K=1024). If MMA shows `k < 15` (`K_TILES - 1`), the barrier phases drift and the second tile deadlocks.
+
+**Step 6: Check `tcgen05.alloc/dealloc` have all 32 lanes participating**
+
+```bash
+python inspect_cuda.py 7 | grep -B5 "tcgen05_alloc"
+```
+
+Buggy code:
+```c
+if ((warp_id_in_cta % 4) == 0) {    // warp guard — OK
+  if (((int)threadIdx.x) % 32 == 0) { // lane guard — WRONG, only 1 thread
+    tcgen05_alloc(...);
+  }
+}
+```
+
+Correct code:
+```c
+if ((warp_id_in_cta >> 2) == 0) {    // wg guard
+  if ((warp_id_in_cta % 4) == 0) {   // warp guard — all 32 lanes execute
+    tcgen05_alloc(...);               // no lane guard
+  }
+}
+```
+
+### Debugging Crashes (XID 43 / Illegal Memory Access)
+
+The kernel corrupts the CUDA context, so subsequent CUDA calls (even `torch.randn`) fail.
+
+**Common causes:**
+
+1. **`pool.alloc` after `pool.commit()`** — buffer has invalid SMEM address.
+    ```bash
+    grep -n "pool\.\|commit\|TMABar\|TCGen05Bar\|MBarrier" gemm_kernels.py
+    ```
+
+2. **`tcgen05.alloc/dealloc` with single-thread guard** — see Step 6 above.
+
+3. **Missing `cta_sync()` before `tcgen05.dealloc`** — TMEM freed while writeback still reading. Check the generated code ends with:
+    ```c
+    tvm_builtin_cuda_cta_sync();           // all threads sync first
+    if ((warp_id_in_cta % 4) == 0) {       // then dealloc
+      tcgen05_relinquish_alloc_permit();
+      tcgen05_dealloc(...);
+    }
+    ```
+
+### Debugging Wrong Results
+
+Specific mismatch counts (128, 253, 381) indicate synchronization bugs, not arithmetic errors. 128 = one thread's worth of output (one row of a 128-wide tile).
+
+**Common causes:**
+
+1. **Missing `cta_sync()` before `fence.after_thread_sync()`** (Steps 4–6): other threads read TMEM before MMA finishes.
+2. **Missing `fence.proxy_async("shared::cta")` before TMA store**: TMA engine doesn't see SMEM writes.
+3. **Missing `cp_async.bulk.commit_group()` / `wait_group(0)` after TMA store**: store doesn't complete before SMEM is reused.
 
 ---
 
