@@ -659,6 +659,7 @@ This doubles the compute density per CTA: each CTA now processes a 256x256 outpu
 - Writeback **must** use chunked EPI_N (e.g., 64 or smaller) — reading all 256 TMEM columns at once exceeds register capacity
 - Tile scheduler: `num_m_tiles=M // 256 // NUM_CONSUMER` — cluster tile is now 512x256
 - TMA arrive bytes: `CTA_GROUP * (NUM_CONSUMER * BLK_M * BLK_K + BLK_N * BLK_K) * DTYPE_SIZE` — 2 A blocks + 1 B block per CTA
+- Writeback uses `warpgroup_sync(wg_id + 10)` — each WG needs its own barrier ID. Using the same ID (e.g., `warpgroup_sync(10)`) for both WG0 and WG1 mixes their threads on a single barrier, causing partial writes and deadlocks at large sizes. This is something you should watch out for carefully.
 
 **Test:** `pytest tests/test_step10.py -xvs`
 
